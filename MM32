@@ -1,0 +1,284 @@
+#Conditions and assumptions
+##Reported model values used here: 25 starting bacteria, maximum 80 bacteria, 10,000 initial MM32 signals, 60 signal-binding sites per bacterium, 120 polymer-binding sites per bacterium, 2 bacterial-binding sites and 5 signal-binding sites per polymer, KBS=0.5 with kBS+=0.001 and kBS−=0.002, Ksyn=0.05, degradation magnitude 0.01, luminescence scale 2500, MM32 BSc=38, and 10 independent runs.
+##Explicit assumptions required to make the approximate model runnable: one polymer object per starting bacterium at 0.05 mg/mL, scaled linearly with concentration; polymer forward rates 0.001 and reverse rates derived from k_off=k_on/K; division times are triangular(5,000, 15,000, 25,000); signals and polymers occupy one well-mixed compartment. Random seeds are 101–110. These assumptions are not all specified by the paper.
+
+import math
+import random
+import statistics
+import matplotlib.pyplot as plt
+
+# Reported values and explicit approximation assumptions.
+INITIAL_BACTERIA = 25
+MAX_BACTERIA = 80
+INITIAL_SIGNALS_MM32 = 10_000
+B_SIGNAL_SITES_PER_B = 60
+B_POLYMER_SITES_PER_B = 120
+P_BACTERIA_SITES_PER_P = 2
+P_SIGNAL_SITES_PER_P = 5
+KBS_ON = 0.001
+KBS_OFF = 0.002
+KSYN = 0.05
+KDEGRAD = 0.01
+LUM_SCALE = 2500.0
+BSC_MM32 = 38.0
+ASSUMED_KPB_ON = 0.001
+ASSUMED_KPS_ON = 0.001
+POLYMERS_PER_BACTERIUM_PER_0_05_MG_ML = 1.0
+END_TIME = 30_000.0
+SAMPLE_INTERVAL = 100.0
+SEEDS = tuple(range(101, 111))
+AFFINITY_VALUES = (0.1, 0.5, 1.0, 5.0, 10.0)
+POLYMER_CONCENTRATIONS = (0.05, 0.125, 0.25, 0.5)
+
+
+def polymer_count_from_concentration(concentration_mg_ml, initial_bacteria=INITIAL_BACTERIA):
+    """Assumption: 1 polymer per starting cell at 0.05 mg/mL, linearly scaled."""
+    if concentration_mg_ml < 0:
+        raise ValueError("Polymer concentration cannot be negative")
+    raw = initial_bacteria * concentration_mg_ml / 0.05 * POLYMERS_PER_BACTERIUM_PER_0_05_MG_ML
+    return int(math.floor(raw + 0.5))
+
+
+def mm32_luminescence_per_bacterium(bs_express):
+    delta_bs = 0.25 * (BSC_MM32 - bs_express)
+    return LUM_SCALE * (1 - math.exp(delta_bs - 1) / (math.exp(delta_bs) + 1))
+
+
+def update_expression(expr, bs_sense, dt):
+    """Integrate the supplied synthesis/degradation ODE while BS_sense is fixed."""
+    if dt <= 0:
+        return expr
+    if bs_sense > expr:
+        return bs_sense + (expr - bs_sense) * math.exp(-KSYN * dt)
+    if bs_sense < expr:
+        return expr * math.exp(-KDEGRAD * dt)
+    return expr
+
+
+def run_mm32(concentration_mg_ml, kpb, kps, seed,
+             end_time=END_TIME, sample_interval=SAMPLE_INTERVAL):
+    """Run one well-mixed MM32 Gillespie approximation."""
+    if end_time <= 0 or sample_interval <= 0:
+        raise ValueError("end_time and sample_interval must be positive")
+    rng = random.Random(seed)
+    B = INITIAL_BACTERIA
+    P = polymer_count_from_concentration(concentration_mg_ml, B)
+    S_free = INITIAL_SIGNALS_MM32
+    BS_bound = PS_bound = PB_bound = 0
+    expr = 0.0
+    t = 0.0
+
+    kpb_on = 0.0 if (P == 0 or kpb == 0) else ASSUMED_KPB_ON
+    kpb_off = 0.0 if (P == 0 or kpb == 0) else kpb_on / kpb
+    kps_on = 0.0 if (P == 0 or kps == 0) else ASSUMED_KPS_ON
+    kps_off = 0.0 if (P == 0 or kps == 0) else kps_on / kps
+
+    division_times = [rng.triangular(5000.0, 25000.0, 15000.0) for _ in range(B)]
+    next_sample = 0.0
+    sample_times, light_values = [], []
+    event_counts = {name: 0 for name in (
+        "BS_on", "BS_off", "PS_on", "PS_off", "PB_on", "PB_off", "division"
+    )}
+
+    def record_until(cutoff):
+        nonlocal expr, next_sample, t
+        while next_sample <= cutoff and next_sample <= end_time:
+            expr = update_expression(expr, BS_bound / max(B, 1), next_sample - t)
+            t = next_sample
+            sample_times.append(t)
+            light_values.append(B * mm32_luminescence_per_bacterium(expr))
+            next_sample += sample_interval
+
+    while t < end_time:
+        free_BS = max(0, B * B_SIGNAL_SITES_PER_B - BS_bound)
+        free_PS = max(0, P * P_SIGNAL_SITES_PER_P - PS_bound)
+        free_BP = max(0, B * B_POLYMER_SITES_PER_B - PB_bound)
+        free_PB = max(0, P * P_BACTERIA_SITES_PER_P - PB_bound)
+        events = [
+            (KBS_ON * free_BS * S_free, "BS_on"),
+            (KBS_OFF * BS_bound, "BS_off"),
+            (kps_on * free_PS * S_free, "PS_on"),
+            (kps_off * PS_bound, "PS_off"),
+            (kpb_on * free_BP * free_PB, "PB_on"),
+            (kpb_off * PB_bound, "PB_off"),
+        ]
+        total = sum(rate for rate, _ in events)
+        next_division = min(division_times) if division_times else math.inf
+        if total <= 0:
+            if next_division == math.inf:
+                record_until(end_time)
+                break
+            event_time, event_name = next_division, "division"
+        else:
+            tau = -math.log(max(rng.random(), 1e-15)) / total
+            stochastic_time = t + tau
+            if next_division < stochastic_time:
+                event_time, event_name = next_division, "division"
+            else:
+                threshold = rng.random() * total
+                cumulative = 0.0
+                event_name = events[-1][1]
+                for rate, name in events:
+                    cumulative += rate
+                    if threshold <= cumulative:
+                        event_name = name
+                        break
+                event_time = stochastic_time
+
+        record_until(event_time)
+        expr = update_expression(expr, BS_bound / max(B, 1), event_time - t)
+        t = event_time
+        if t >= end_time:
+            break
+
+        if event_name == "division":
+            due = min(range(len(division_times)), key=division_times.__getitem__)
+            division_times.pop(due)
+            if B < MAX_BACTERIA:
+                old_B = B
+                B += 1
+                expr *= old_B / B  # mean-state approximation; new daughter starts at zero expression
+                event_counts["division"] += 1
+                division_times.append(t + rng.triangular(5000.0, 25000.0, 15000.0))
+                division_times.append(t + rng.triangular(5000.0, 25000.0, 15000.0))
+            else:
+                division_times.append(t + rng.triangular(5000.0, 25000.0, 15000.0))
+            continue
+
+        event_counts[event_name] += 1
+        if event_name == "BS_on": S_free -= 1; BS_bound += 1
+        elif event_name == "BS_off": S_free += 1; BS_bound -= 1
+        elif event_name == "PS_on": S_free -= 1; PS_bound += 1
+        elif event_name == "PS_off": S_free += 1; PS_bound -= 1
+        elif event_name == "PB_on": PB_bound += 1
+        elif event_name == "PB_off": PB_bound -= 1
+
+    return {
+        "times": sample_times,
+        "light": light_values,
+        "events": event_counts,
+        "final_B": B,
+        "final_state": {"B": B, "P": P, "S_free": S_free,
+                       "BS_bound": BS_bound, "PS_bound": PS_bound,
+                       "PB_bound": PB_bound},
+        "seed": seed,
+    }
+
+print("MM32 initial signal count:", INITIAL_SIGNALS_MM32)
+print("Polymer object counts at tested concentrations:", {
+    c: polymer_count_from_concentration(c) for c in POLYMER_CONCENTRATIONS
+})
+
+POLYMER_CONCENTRATION = 0.25  # mg/mL
+CONDITIONS = {
+    "No polymer": (0.0, 0.0, 0.0),
+    "P1 (KPB=5, KPS=0)": (POLYMER_CONCENTRATION, 5.0, 0.0),
+    "P2 (KPB=0, KPS=0.1)": (POLYMER_CONCENTRATION, 0.0, 0.1),
+    "P3 (KPB=5, KPS=10)": (POLYMER_CONCENTRATION, 5.0, 10.0),
+}
+MM32_RUNS = {
+    name: [run_mm32(concentration, kpb, kps, seed) for seed in SEEDS]
+    for name, (concentration, kpb, kps) in CONDITIONS.items()
+}
+
+plt.figure(figsize=(9, 5))
+for name, runs in MM32_RUNS.items():
+    times = runs[0]["times"]
+    means = [statistics.mean(run["light"][i] for run in runs) for i in range(len(times))]
+    sds = [statistics.stdev(run["light"][i] for run in runs) for i in range(len(times))]
+    plt.plot(times, means, label=name)
+    plt.fill_between(times, [m-s for m,s in zip(means,sds)],
+                     [m+s for m,s in zip(means,sds)], alpha=0.18)
+plt.xlabel("Time (a.u.)")
+plt.ylabel("Total luminescence (approximation)")
+plt.title(f"MM32 time courses at {POLYMER_CONCENTRATION:g} mg/mL; mean ± SD, n={len(SEEDS)}")
+plt.legend()
+plt.tight_layout()
+plt.show()
+print("Seeds:", SEEDS)
+
+AFFINITY_CONCENTRATION = 0.25  # mg/mL
+NO_POLYMER_CONTROLS = {
+    seed: run_mm32(0.0, 0.0, 0.0, seed) for seed in SEEDS
+}
+fold_matrix = []
+sd_matrix = []
+for kpb in AFFINITY_VALUES:
+    mean_row, sd_row = [], []
+    for kps in AFFINITY_VALUES:
+        replicate_folds = []
+        for seed in SEEDS:
+            with_polymer = run_mm32(AFFINITY_CONCENTRATION, kpb, kps, seed)
+            no_polymer = NO_POLYMER_CONTROLS[seed]
+            replicate_folds.append(with_polymer["light"][-1] / no_polymer["light"][-1])
+        mean_row.append(statistics.mean(replicate_folds))
+        sd_row.append(statistics.stdev(replicate_folds))
+    fold_matrix.append(mean_row)
+    sd_matrix.append(sd_row)
+
+fig, ax = plt.subplots(figsize=(7, 5.5))
+heat = ax.imshow(fold_matrix, origin="lower", cmap="viridis", aspect="auto")
+ax.set_xticks(range(len(AFFINITY_VALUES)), labels=AFFINITY_VALUES)
+ax.set_yticks(range(len(AFFINITY_VALUES)), labels=AFFINITY_VALUES)
+ax.set_xlabel("Signal-binding affinity KPS (a.u.)")
+ax.set_ylabel("Bacteria-binding affinity KPB (a.u.)")
+ax.set_title(f"MM32 endpoint luminescence fold change at {AFFINITY_CONCENTRATION:g} mg/mL")
+fig.colorbar(heat, ax=ax, label="Fold change vs no-polymer control")
+for y in range(len(AFFINITY_VALUES)):
+    for x in range(len(AFFINITY_VALUES)):
+        ax.text(x, y, f"{fold_matrix[y][x]:.2f}", ha="center", va="center",
+                color="white", fontsize=8)
+fig.tight_layout()
+plt.show()
+print("Affinity values:", AFFINITY_VALUES)
+print("Seeds:", SEEDS)
+
+# Matched no-polymer baselines reused across polymer types and concentrations.
+FIG2C_CONTROLS = {seed: run_mm32(0.0, 0.0, 0.0, seed) for seed in SEEDS}
+POLYMERS = {
+    "P1 (KPB=5, KPS=0)": (5.0, 0.0),
+    "P2 (KPB=0, KPS=0.1)": (0.0, 0.1),
+    "P3 (KPB=5, KPS=10)": (5.0, 10.0),
+}
+fold_timecourses = {}
+for polymer_name, (kpb, kps) in POLYMERS.items():
+    fold_timecourses[polymer_name] = {}
+    for concentration in POLYMER_CONCENTRATIONS:
+        replicate_folds = []
+        for seed in SEEDS:
+            run = run_mm32(concentration, kpb, kps, seed)
+            baseline = FIG2C_CONTROLS[seed]
+            replicate_folds.append([
+                value / control if control else float("nan")
+                for value, control in zip(run["light"], baseline["light"])
+            ])
+        n_times = len(replicate_folds[0])
+        means = [statistics.mean(row[i] for row in replicate_folds) for i in range(n_times)]
+        sds = [statistics.stdev(row[i] for row in replicate_folds) for i in range(n_times)]
+        fold_timecourses[polymer_name][concentration] = {
+            "times": run["times"], "mean": means, "sd": sds
+        }
+
+fig, axes = plt.subplots(1, 3, figsize=(16, 4.8), sharey=True)
+colors = plt.cm.viridis([i / (len(POLYMER_CONCENTRATIONS)-1)
+                         for i in range(len(POLYMER_CONCENTRATIONS))])
+for ax, (polymer_name, by_concentration) in zip(axes, fold_timecourses.items()):
+    for color, concentration in zip(colors, POLYMER_CONCENTRATIONS):
+        series = by_concentration[concentration]
+        ax.plot(series["times"], series["mean"], color=color,
+                label=f"{concentration:g} mg/mL")
+        ax.fill_between(series["times"],
+                        [m-s for m,s in zip(series["mean"],series["sd"])],
+                        [m+s for m,s in zip(series["mean"],series["sd"])],
+                        color=color, alpha=0.10)
+    ax.axhline(1.0, color="black", linewidth=0.8, linestyle="--")
+    ax.set_title(polymer_name)
+    ax.set_xlabel("Time (a.u.)")
+    ax.set_xlim(0, END_TIME)
+axes[0].set_ylabel("Fold change vs matched no-polymer control")
+axes[-1].legend(title="Polymer concentration", bbox_to_anchor=(1.02, 1), loc="upper left")
+fig.suptitle("MM32 concentration response — approximate well-mixed model")
+fig.tight_layout()
+plt.show()
+print("Concentrations (mg/mL):", POLYMER_CONCENTRATIONS)
+print("Seeds:", SEEDS)
